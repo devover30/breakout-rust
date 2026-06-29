@@ -1,58 +1,9 @@
+use breakout_rust::{AppError, PivotEngine};
 use chrono::{Local, NaiveTime, Timelike};
 use chrono_tz::Asia::Kolkata;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::types::BigDecimal;
-use sqlx::{Pool, Postgres};
-use std::error::Error;
 use std::time::Duration;
-use std::{env, fmt, process};
-use tokio::task::JoinSet;
+use std::{env, process};
 use tracing_subscriber::fmt::time::FormatTime;
-
-// 1. Define a native custom error type
-#[derive(Debug)]
-pub enum AppError {
-    Database(sqlx::Error),
-    Config(String),
-}
-
-// 2. Implement standard Display formatting required by std::error::Error
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AppError::Database(e) => write!(f, "Database failure: {}", e),
-            AppError::Config(e) => write!(f, "Configuration error: {}", e),
-        }
-    }
-}
-
-// 3. Implement the core standard error trait
-impl Error for AppError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            AppError::Database(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-// 4. Implement standard From trait to support the native `?` operator automatically
-impl From<sqlx::Error> for AppError {
-    fn from(err: sqlx::Error) -> Self {
-        AppError::Database(err)
-    }
-}
-
-#[derive(sqlx::FromRow, Debug)]
-struct Candle {
-    symbol: String,
-    bucket_ist: chrono::NaiveDateTime,
-    open: BigDecimal,
-    high: BigDecimal,
-    low: BigDecimal,
-    close: BigDecimal,
-    volume: i64,
-}
 
 // 1. Create a dedicated IST formatter struct
 struct IstTimer;
@@ -91,10 +42,8 @@ async fn main() -> Result<(), AppError> {
 
     tracing::info!("Symbols configured from Makefile: {:?}", symbols);
 
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await?;
+    // 1. Initialize the library engine object directly with configuration rules
+    let engine = PivotEngine::new(&db_url, 5).await?;
 
     let market_start = NaiveTime::from_hms_opt(9, 20, 0).unwrap();
     let market_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
@@ -126,79 +75,29 @@ async fn main() -> Result<(), AppError> {
         );
         tokio::time::sleep(Duration::from_secs(total_seconds_to_wait as u64)).await;
 
-        if let Err(e) = fetch_latest_candles(&pool, &symbols).await {
-            tracing::error!("Error pulling engine logs: {}", e);
-            process::exit(1);
+        match engine.fetch_latest_candles(&symbols).await {
+            Ok(candles) => {
+                for candle in candles {
+                    tracing::info!(
+                        "[{}] Engine Metric -> O: {}, H: {}, L: {}, C: {}",
+                        candle.symbol,
+                        candle.open,
+                        candle.high,
+                        candle.low,
+                        candle.close
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error pulling engine logs: {}", e);
+                process::exit(1);
+            }
         }
 
         let post_fetch_time = Local::now().with_timezone(&Kolkata).time();
         if post_fetch_time >= market_close {
             tracing::info!("15:30 PM final interval met. Terminating app safely.");
             break;
-        }
-    }
-
-    Ok(())
-}
-
-async fn fetch_latest_candles(pool: &Pool<Postgres>, symbols: &[String]) -> Result<(), AppError> {
-    tracing::info!("Querying metrics concurrently across the watchlist...");
-
-    let mut set = JoinSet::new();
-
-    // 1. Spawn each query as an concurrent task into the JoinSet
-    for symbol in symbols {
-        let pool = pool.clone();
-        let symbol = symbol.clone();
-
-        set.spawn(async move {
-            let query = r#"
-                SELECT symbol,
-                time_bucket('5 minutes', ltt) AT TIME ZONE 'Asia/Kolkata' AS bucket_ist,
-                first(ltp, ltt) AS open,
-                max(ltp)        AS high,
-                min(ltp)        AS low,
-                last(ltp, ltt)  AS close,
-                max(cum_volume) - min(cum_volume) AS volume
-                FROM ticks
-                WHERE symbol = $1
-                GROUP BY symbol, time_bucket('5 minutes', ltt)
-                ORDER BY bucket_ist DESC 
-                LIMIT 1;
-            "#;
-
-            sqlx::query_as::<_, Candle>(query)
-                .bind(symbol)
-                .fetch_optional(&pool)
-                .await
-        });
-    }
-
-    // 2. Await the tasks as they complete
-    while let Some(res) = set.join_next().await {
-        match res {
-            // The outer Result handles task spawning panics
-            Ok(db_res) => {
-                // The inner Result handles actual SQLx database execution errors
-                match db_res {
-                    Ok(Some(candle)) => {
-                        tracing::info!(
-                            "[{}] Bucket IST: {}, O: {}, H: {}, L: {}, C: {}, Vol: {}",
-                            candle.symbol,
-                            candle.bucket_ist.format("%Y-%m-%d %H:%M:%S"),
-                            candle.open,
-                            candle.high,
-                            candle.low,
-                            candle.close,
-                            candle.volume
-                        );
-                        // >> Hook your Pivot Level Strategy Breakout logic here <<
-                    }
-                    Ok(None) => {} // No records found for this symbol yet
-                    Err(e) => tracing::error!("Database query execution failure: {}", e),
-                }
-            }
-            Err(join_err) => tracing::error!("Task join execution failed: {}", join_err),
         }
     }
 

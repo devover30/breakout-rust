@@ -2,7 +2,7 @@
 export DATABASE_URL=postgres://db_user:User_2026@localhost:5432/trading
 
 # List of trading symbols to track
-export FYERS_SYMBOLS=NSE:BSE-EQ,NSE:NIFTY50-INDEX,NSE:MIDCPNIFTY-INDEX
+export FYERS_SYMBOLS=NSE:NIFTY50-INDEX,NSE:MIDCPNIFTY-INDEX
 
 .PHONY: run build clean
 
