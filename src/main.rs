@@ -6,6 +6,7 @@ use sqlx::{Pool, Postgres};
 use std::error::Error;
 use std::time::Duration;
 use std::{env, fmt, process};
+use tokio::task::JoinSet;
 use tracing_subscriber::fmt::time::FormatTime;
 
 // 1. Define a native custom error type
@@ -141,39 +142,64 @@ async fn main() -> Result<(), AppError> {
 }
 
 async fn fetch_latest_candles(pool: &Pool<Postgres>, symbols: &[String]) -> Result<(), AppError> {
-    tracing::info!("Executing 5-minute interval database fetch...");
+    tracing::info!("Querying metrics concurrently across the watchlist...");
 
-    let query = r#"
-        SELECT symbol,
-            time_bucket('5 minutes', ltt) AT TIME ZONE 'Asia/Kolkata' AS bucket_ist,
-            first(ltp, ltt) AS open,
-            max(ltp)        AS high,
-            min(ltp)        AS low,
-            last(ltp, ltt)  AS close,
-            max(cum_volume) - min(cum_volume) AS volume
-            FROM ticks
-            WHERE symbol = ANY($1)
-            GROUP BY symbol, time_bucket('5 minutes', ltt)
-            ORDER BY bucket_ist DESC LIMIT 1;
-        "#;
+    let mut set = JoinSet::new();
 
-    // The ? operator natively maps via our From implementation
-    let candles = sqlx::query_as::<_, Candle>(query)
-        .bind(symbols)
-        .fetch_all(pool)
-        .await?;
+    // 1. Spawn each query as an concurrent task into the JoinSet
+    for symbol in symbols {
+        let pool = pool.clone();
+        let symbol = symbol.clone();
 
-    for candle in candles {
-        tracing::info!(
-            "[{}] Bucket IST: {}, O: {}, H: {}, L: {}, C: {}, Vol: {}",
-            candle.symbol,
-            candle.bucket_ist.format("%Y-%m-%d %H:%M:%S"),
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-            candle.volume
-        );
+        set.spawn(async move {
+            let query = r#"
+                SELECT symbol,
+                time_bucket('5 minutes', ltt) AT TIME ZONE 'Asia/Kolkata' AS bucket_ist,
+                first(ltp, ltt) AS open,
+                max(ltp)        AS high,
+                min(ltp)        AS low,
+                last(ltp, ltt)  AS close,
+                max(cum_volume) - min(cum_volume) AS volume
+                FROM ticks
+                WHERE symbol = $1
+                GROUP BY symbol, time_bucket('5 minutes', ltt)
+                ORDER BY bucket_ist DESC 
+                LIMIT 1;
+            "#;
+
+            sqlx::query_as::<_, Candle>(query)
+                .bind(symbol)
+                .fetch_optional(&pool)
+                .await
+        });
+    }
+
+    // 2. Await the tasks as they complete
+    while let Some(res) = set.join_next().await {
+        match res {
+            // The outer Result handles task spawning panics
+            Ok(db_res) => {
+                // The inner Result handles actual SQLx database execution errors
+                match db_res {
+                    Ok(Some(candle)) => {
+                        tracing::info!(
+                            "[{}] Bucket IST: {}, O: {}, H: {}, L: {}, C: {}, Vol: {}",
+                            candle.symbol,
+                            candle.bucket_ist.format("%Y-%m-%d %H:%M:%S"),
+                            candle.open,
+                            candle.high,
+                            candle.low,
+                            candle.close,
+                            candle.volume
+                        );
+                        // >> Hook your Pivot Level Strategy Breakout logic here <<
+                    }
+                    Ok(None) => {} // No records found for this symbol yet
+                    Err(e) => tracing::error!("Database query execution failure: {}", e),
+                }
+            }
+            Err(join_err) => tracing::error!("Task join execution failed: {}", join_err),
+        }
     }
 
     Ok(())
