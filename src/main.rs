@@ -85,8 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cutoff = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
 
     loop {
-        sleep_to_next_boundary().await;
-
         let now = Utc::now().with_timezone(&Kolkata).time();
 
         if now >= cutoff {
@@ -146,5 +144,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        sleep_to_next_boundary().await;
     }
 }
