@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http = reqwest::Client::new();
 
     let mut placed: HashSet<String> = HashSet::new();
-    let start = NaiveTime::from_hms_opt(9, 20, 0).unwrap();
+    let start = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
     let cutoff = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
 
     loop {
