@@ -9,12 +9,17 @@
 
 use chrono::{FixedOffset, NaiveTime, Utc};
 use chrono_tz::Asia::Kolkata;
+use redis::{AsyncCommands, ExistenceCheck, SetExpiry, SetOptions};
 use rust_candle_fetcher::{Candle, PivotEngine};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::process;
 use std::time::Duration;
+use tracing::{error, info};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
+
+const DAILY_ORDER: i64 = 2;
 
 // ---- IST logging --------------------------------------------------------
 
@@ -40,6 +45,64 @@ struct Urls {
 struct Pivot {
     r1: f64,
     s1: f64,
+}
+
+struct Status {
+    symbol: String,
+    long: i64,
+    short: i64,
+}
+
+// Read both direction counters for a symbol (missing key -> 0)
+async fn get_status(con: &mut redis::aio::MultiplexedConnection, symbol: &str) -> Status {
+    let long_key = format!("breakout:order:{}:long", symbol);
+    let short_key = format!("breakout:order:{}:short", symbol);
+
+    let long: Option<i64> = redis::cmd("GET")
+        .arg(&long_key)
+        .query_async(con)
+        .await
+        .unwrap_or_else(|e| {
+            error!("redis get long error: {}", e);
+            process::exit(1);
+        });
+    let short: Option<i64> = redis::cmd("GET")
+        .arg(&short_key)
+        .query_async(con)
+        .await
+        .unwrap_or_else(|e| {
+            error!("redis get short error: {}", e);
+            process::exit(1);
+        });
+
+    Status {
+        symbol: symbol.to_string(),
+        long: long.unwrap_or(0),
+        short: short.unwrap_or(0),
+    }
+}
+
+// Initialize both counters to 0 once per day (NX so restarts don't wipe counts)
+async fn init_counters(con: &mut redis::aio::MultiplexedConnection, symbol: &str, ttl: u64) {
+    for side in ["long", "short"] {
+        let key = format!("breakout:order:{}:{}", symbol, side);
+        let opts = SetOptions::default()
+            .conditional_set(ExistenceCheck::NX)
+            .with_expiration(SetExpiry::EX(ttl));
+        let _: Option<String> = con.set_options(&key, 0, opts).await.unwrap_or_else(|e| {
+            error!("redis init error: {}", e);
+            process::exit(1);
+        });
+    }
+}
+
+// Bump one direction's counter after firing
+async fn incr_counter(con: &mut redis::aio::MultiplexedConnection, symbol: &str, side: &str) {
+    let key = format!("breakout:order:{}:{}", symbol, side);
+    let _: i64 = con.incr(&key, 1).await.unwrap_or_else(|e| {
+        error!("redis incr error: {}", e);
+        process::exit(1);
+    });
 }
 
 // BigDecimal -> f64 (simple, dependency-free)
@@ -94,9 +157,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut redis_con = redis_client.get_multiplexed_async_connection().await?;
     let http = reqwest::Client::new();
 
-    let mut placed: HashSet<String> = HashSet::new();
     let start = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
     let cutoff = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+
+    let ttl = (cutoff - Utc::now().with_timezone(&Kolkata).time())
+        .num_seconds()
+        .max(1) as u64;
+    for symbol in &symbols {
+        init_counters(&mut redis_con, symbol.as_str(), ttl).await;
+    }
 
     loop {
         let now = Utc::now().with_timezone(&Kolkata).time();
@@ -106,6 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(0);
         }
         if now < start {
+            let secs = (start - now).num_seconds().max(1) as u64;
+            tracing::info!("Before market open, sleeping {}s", secs);
+            tokio::time::sleep(Duration::from_secs(secs)).await;
             continue; // before the first tradeable candle
         }
 
@@ -118,10 +190,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         for candle in candles {
-            if placed.contains(&candle.symbol) {
-                continue; // already traded this symbol today
-            }
-
             let pivot = match get_pivot(&mut redis_con, &candle.symbol).await {
                 Some(p) => p,
                 None => {
@@ -134,28 +202,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => continue,
             };
 
+            let status = get_status(&mut redis_con, &candle.symbol).await;
             let close = close_f64(&candle);
 
             if close > pivot.r1 {
-                tracing::info!(
-                    "{} LONG  (close {} > R1 {})",
-                    candle.symbol,
-                    close,
-                    pivot.r1
-                );
-                if fire(&http, &urls.long).await {
-                    placed.insert(candle.symbol.clone());
+                if status.long >= DAILY_ORDER {
+                    info!("Long Cap reached for this : {}", &candle.symbol);
+                    continue; // long cap reached for this symbol
                 }
+                info!("{} LONG (close {} > R1 {})", candle.symbol, close, pivot.r1);
+                fire(&http, &urls.long).await;
+                incr_counter(&mut redis_con, &candle.symbol, "long").await;
             } else if close < pivot.s1 {
-                tracing::info!(
-                    "{} SHORT (close {} < S1 {})",
-                    candle.symbol,
-                    close,
-                    pivot.s1
-                );
-                if fire(&http, &urls.short).await {
-                    placed.insert(candle.symbol.clone());
+                if status.short >= DAILY_ORDER {
+                    info!("Short Cap reached for this : {}", &candle.symbol);
+                    continue; // short cap reached for this symbol
                 }
+                info!(
+                    "{} SHORT (close {} < S1 {})",
+                    candle.symbol, close, pivot.s1
+                );
+                fire(&http, &urls.short).await;
+                incr_counter(&mut redis_con, &candle.symbol, "short").await;
             }
         }
         sleep_to_next_boundary().await;
