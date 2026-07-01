@@ -7,12 +7,26 @@
 //   - One order per symbol per day (tracked in memory).
 //   - No signals before 09:20 IST, hard shutdown at 14:30 IST.
 
-use chrono::{NaiveTime, Utc};
+use chrono::{FixedOffset, NaiveTime, Utc};
 use chrono_tz::Asia::Kolkata;
 use rust_candle_fetcher::{Candle, PivotEngine};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+
+// ---- IST logging --------------------------------------------------------
+
+struct IstTimer;
+
+impl FormatTime for IstTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let now = Utc::now().with_timezone(&ist);
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S IST"))
+    }
+}
 
 // ---- syms.json : { "<symbol>": { "short": "<url>", "long": "<url>" } } ----
 #[derive(Deserialize)]
@@ -65,7 +79,7 @@ async fn fire(http: &reqwest::Client, url: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init(); // swap in your IstTimer subscriber if desired
+    tracing_subscriber::fmt().with_timer(IstTimer).init(); // swap in your IstTimer subscriber if desired
 
     let db_url = std::env::var("DATABASE_URL")?;
     let redis_url = std::env::var("REDIS_URL")?;
