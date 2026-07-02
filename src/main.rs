@@ -12,14 +12,14 @@ use chrono_tz::Asia::Kolkata;
 use redis::{AsyncCommands, ExistenceCheck, SetExpiry, SetOptions};
 use rust_candle_fetcher::{Candle, PivotEngine};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process;
 use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
-const DAILY_ORDER: i64 = 2;
+const DAILY_ORDER: i64 = 1;
 
 // ---- IST logging --------------------------------------------------------
 
@@ -116,7 +116,7 @@ async fn sleep_to_next_boundary() {
     let now = Utc::now().timestamp();
     let period = 300; // 5 minutes
     let next = ((now / period) + 1) * period;
-    let secs = (next - now) as u64 + 3; // +3s so the closed candle is settled in the DB
+    let secs = (next - now) as u64; // +3s so the closed candle is settled in the DB
     tokio::time::sleep(Duration::from_secs(secs)).await;
 }
 
@@ -148,9 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = std::env::var("REDIS_URL")?;
 
     // syms.json lives in the project root
-    let syms: HashMap<String, Urls> = serde_json::from_str(&std::fs::read_to_string("syms.json")?)?;
+    let syms: HashMap<String, Urls> = toml::from_str(&std::fs::read_to_string("syms.toml")?)?;
     let symbols: Vec<String> = syms.keys().cloned().collect();
-    tracing::info!("Loaded {} symbols from syms.json", symbols.len());
+    info!("{:?}", symbols);
+    tracing::info!("Loaded {} symbols from syms.toml", symbols.len());
 
     let engine = PivotEngine::new(&db_url, 5).await?;
     let redis_client = redis::Client::open(redis_url)?;
