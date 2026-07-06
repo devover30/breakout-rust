@@ -203,15 +203,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => continue,
             };
 
-            let status = get_status(&mut redis_con, &candle.symbol).await;
+            let status: Status = get_status(&mut redis_con, &candle.symbol).await;
             let close = close_f64(&candle);
 
             if close > pivot.r1 {
                 if status.long >= DAILY_ORDER {
-                    info!("Long Cap reached for this : {}", &candle.symbol);
+                    info!("Long Cap reached for this : {}", &status.symbol);
                     continue; // long cap reached for this symbol
                 }
-                info!("{} LONG (close {} > R1 {})", candle.symbol, close, pivot.r1);
+                info!("{} LONG (close {} > R1 {})", status.symbol, close, pivot.r1);
                 fire(&http, &urls.long).await;
                 incr_counter(&mut redis_con, &candle.symbol, "long").await;
             } else if close < pivot.s1 {
