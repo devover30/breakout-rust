@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut redis_con = redis_client.get_multiplexed_async_connection().await?;
     let http = reqwest::Client::new();
 
-    let start = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+    let start = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
     let cutoff = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
 
     let ttl = (cutoff - Utc::now().with_timezone(&Kolkata).time())
